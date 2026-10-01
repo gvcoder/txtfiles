@@ -1,0 +1,28 @@
+import { Laya } from "@receptron/laya";
+
+const laya = await Laya.load();
+
+const result = await laya.systemOne(
+    { subject: "Refund not received", body: "I cancelled two weeks ago and still have no refund..." },
+    {
+        department: {
+            type: "choice",
+            instructions: "Which team should handle this ticket?",
+            criteria: { billing: "payments, refunds, invoices", support: "product help and bugs", sales: "new purchases" },
+        },
+        urgency: {
+            type: "score",
+            instructions: "How urgent is this ticket?",
+            criteria: ["not urgent", "somewhat urgent", "urgent", "critical"],
+        },
+        churn_risk: { type: "noul", instructions: "Is the customer likely to cancel or dispute?" },
+    },
+);
+
+result.answers.department.choice; // "billing"
+result.answers.department.probabilities; // { billing: 0.9415, support: 0.031, sales: 0.0275 }
+result.answers.urgency.score; // 1.3886   (expected level, 0..3)
+result.answers.churn_risk.noul; // 0.0988   (P(true))
+result.usage.input_tokens; // 267
+
+await laya.close();
