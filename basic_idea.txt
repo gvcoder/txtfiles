@@ -1,0 +1,411 @@
+# Travel Planning Multi-Agent System — Requirements
+
+**Version:** 0.1 (MVP)
+**Stack:** Python · Laya (multi-agent orchestration) · SQLite (dev) / PostgreSQL (prod) · Streamlit (2 apps)
+
+---
+
+## 1. Overview
+
+Two Streamlit applications share a single database:
+
+| App | Purpose | Users |
+|---|---|---|
+| **Admin Console** | CRUD for trips, view/manage agent runs | Ops / dev |
+| **Trip Planner** | Submit a request, watch agents run, view final itinerary | End user |
+
+The backend is a Laya-orchestrated multi-agent pipeline with **deterministic conditional routing** — each agent emits a `decision` enum, and a router picks the next agent from a transition table.
+
+---
+
+## 2. Goals & Non-Goals
+
+### In scope (MVP)
+- Deterministic routing between agents (no LLM-as-router)
+- Full audit trail of every agent hop
+- Loop protection (max hops, retry counters, visited-state detection)
+- Two Streamlit apps (admin + user)
+- Reasonable agent set: intake, budget, visa, weather, alternative, flight, hotel, itinerary, reject
+
+### Out of scope (v0.1)
+- Real API integrations (mock flight/hotel/visa data is fine)
+- Auth / multi-tenancy
+- Payments or booking
+- LLM-based routing (may be v0.2)
+
+---
+
+## 3. Database Schema
+
+Use SQLite for dev; schema is portable to Postgres.
+
+```sql
+-- =========================================================
+-- Core entity: a trip request
+-- =========================================================
+CREATE TABLE trips (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL,
+    origin          TEXT NOT NULL,
+    destination     TEXT NOT NULL,
+    start_date      DATE NOT NULL,
+    end_date        DATE NOT NULL,
+    budget_usd      REAL NOT NULL,
+    travelers       INTEGER NOT NULL DEFAULT 1,
+    preferences     TEXT,              -- JSON blob (freeform)
+    status          TEXT NOT NULL DEFAULT 'pending',
+        -- pending | running | completed | rejected | failed
+    final_result    TEXT,              -- JSON itinerary OR rejection payload
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_trips_status ON trips(status);
+CREATE INDEX idx_trips_user ON trips(user_id);
+
+
+-- =========================================================
+-- Every agent hop is recorded here (append-only)
+-- =========================================================
+CREATE TABLE agent_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id         INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+    step_index      INTEGER NOT NULL,     -- 0-based order within a run
+    agent_name      TEXT NOT NULL,
+    input_json      TEXT NOT NULL,        -- state seen by agent
+    output_json     TEXT NOT NULL,        -- agent's raw output
+    decision        TEXT NOT NULL,        -- enum the router reads
+    confidence      REAL,                 -- 0..1, optional
+    reasoning       TEXT,                 -- short human-readable note
+    next_agent      TEXT,                 -- router's choice
+    duration_ms     INTEGER,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_events_trip ON agent_events(trip_id, step_index);
+
+
+-- =========================================================
+-- Loop protection state per run
+-- =========================================================
+CREATE TABLE run_state (
+    trip_id             INTEGER PRIMARY KEY REFERENCES trips(id) ON DELETE CASCADE,
+    hops_used           INTEGER NOT NULL DEFAULT 0,
+    max_hops            INTEGER NOT NULL DEFAULT 12,
+    alternative_tries   INTEGER NOT NULL DEFAULT 0,
+    max_alternatives    INTEGER NOT NULL DEFAULT 2,
+    visited_states      TEXT NOT NULL DEFAULT '[]',  -- JSON array of "agent:decision"
+    current_agent       TEXT,
+    terminated_reason   TEXT,     -- completed | rejected | loop_guard | max_hops | error
+    started_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    finished_at         TIMESTAMP
+);
+
+
+-- =========================================================
+-- Reference / mock data used by agents
+-- =========================================================
+CREATE TABLE dest_costs (
+    destination     TEXT PRIMARY KEY,
+    daily_cost_usd  REAL NOT NULL,
+    peak_months     TEXT,   -- JSON array like ["Jun","Jul","Aug"]
+    notes           TEXT
+);
+
+CREATE TABLE visa_rules (
+    destination     TEXT NOT NULL,
+    origin          TEXT NOT NULL,
+    requirement     TEXT NOT NULL,   -- visa_free | e_visa | visa_required | blocked
+    processing_days INTEGER,
+    notes           TEXT,
+    PRIMARY KEY (destination, origin)
+);
+
+CREATE TABLE weather_profile (
+    destination     TEXT NOT NULL,
+    month           INTEGER NOT NULL,        -- 1..12
+    suitability     TEXT NOT NULL,           -- good | ok | bad
+    avg_temp_c      REAL,
+    notes           TEXT,
+    PRIMARY KEY (destination, month)
+);
+
+CREATE TABLE mock_flights (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin          TEXT NOT NULL,
+    destination     TEXT NOT NULL,
+    depart_date     DATE NOT NULL,
+    price_usd       REAL NOT NULL,
+    airline         TEXT,
+    duration_hrs    REAL
+);
+
+CREATE TABLE mock_hotels (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    destination     TEXT NOT NULL,
+    check_in        DATE NOT NULL,
+    nightly_usd     REAL NOT NULL,
+    name            TEXT,
+    rating          REAL
+);
+```
+
+---
+
+## 4. Agent Catalog
+
+Each agent is a Laya-callable unit with a **strict output contract**:
+
+```json
+{
+  "decision": "<enum>",
+  "confidence": 0.0,
+  "reasoning": "short string",
+  "payload": { "...agent-specific..." }
+}
+```
+
+| # | Agent | Purpose | Decisions emitted |
+|---|---|---|---|
+| 1 | **IntakeAgent** | Validate trip record, normalize dates/currency, parse preferences | `valid`, `invalid` |
+| 2 | **BudgetAgent** | Estimate total cost (dest_costs × days × travelers) vs budget | `ok`, `tight`, `impossible` |
+| 3 | **VisaAgent** | Look up visa_rules for (origin → destination) | `ok`, `blocked` |
+| 4 | **WeatherAgent** | Check weather_profile for trip months | `good`, `bad` |
+| 5 | **AlternativeAgent** | Propose alternate dates (+N days) or alternate destination | `retry`, `give_up` |
+| 6 | **FlightAgent** | Query mock_flights within budget slice | `found`, `none` |
+| 7 | **HotelAgent** | Query mock_hotels within remaining budget | `found`, `none` |
+| 8 | **ItineraryAgent** | Assemble final plan (flights + hotel + notes) | `complete` |
+| 9 | **RejectAgent** | Produce structured rejection with reason | `rejected` |
+
+**Design rules**
+- Agents are **pure**: same `input_json` → same `output_json` (mock data is fine).
+- Agents never decide the next agent. The **router** does.
+- Every agent writes exactly one row to `agent_events`.
+
+---
+
+## 5. Routing Table (Deterministic Workflow)
+
+The router reads `(agent_name, decision)` and returns `next_agent`.
+
+```python
+ROUTING = {
+    ("IntakeAgent",        "valid"):        "BudgetAgent",
+    ("IntakeAgent",        "invalid"):      "RejectAgent",
+
+    ("BudgetAgent",        "ok"):           "VisaAgent",
+    ("BudgetAgent",        "tight"):        "AlternativeAgent",
+    ("BudgetAgent",        "impossible"):   "RejectAgent",
+
+    ("VisaAgent",          "ok"):           "WeatherAgent",
+    ("VisaAgent",          "blocked"):      "AlternativeAgent",
+
+    ("WeatherAgent",       "good"):         "FlightAgent",
+    ("WeatherAgent",       "bad"):          "AlternativeAgent",
+
+    ("AlternativeAgent",   "retry"):        "BudgetAgent",
+    ("AlternativeAgent",   "give_up"):      "RejectAgent",
+
+    ("FlightAgent",        "found"):        "HotelAgent",
+    ("FlightAgent",        "none"):         "AlternativeAgent",
+
+    ("HotelAgent",         "found"):        "ItineraryAgent",
+    ("HotelAgent",         "none"):         "AlternativeAgent",
+
+    ("ItineraryAgent",     "complete"):     "__END__",
+    ("RejectAgent",        "rejected"):     "__END__",
+}
+```
+
+### Loop & safety guards (checked **before** each hop)
+
+1. `hops_used >= max_hops` → terminate with `loop_guard`.
+2. `(agent_name, decision)` already in `visited_states` → terminate with `loop_guard`.
+3. `alternative_tries >= max_alternatives` → force route to `RejectAgent`.
+4. Unknown `(agent, decision)` pair → terminate with `error`.
+5. Any agent exception → terminate with `error`, log stack in `output_json`.
+
+### Canonical happy path
+```
+Intake → Budget(ok) → Visa(ok) → Weather(good) → Flight(found) → Hotel(found) → Itinerary → END
+```
+
+### Canonical recovery path
+```
+Intake → Budget(tight) → Alternative(retry) → Budget(ok) → Visa → Weather → Flight → Hotel → Itinerary → END
+```
+
+### Canonical rejection path
+```
+Intake → Budget(impossible) → Reject → END
+Intake → Budget(ok) → Visa(blocked) → Alternative(retry) → Budget(ok) → Visa(blocked) → Alternative(give_up) → Reject → END
+```
+
+---
+
+## 6. Orchestrator Contract
+
+```python
+def run_trip(trip_id: int) -> None:
+    state = init_run_state(trip_id)          # inserts run_state row
+    current = "IntakeAgent"
+    step = 0
+
+    while current != "__END__":
+        guard_or_raise(state, current)       # loop / hop / alt counters
+        agent = AGENTS[current]
+        t0 = time.time()
+        output = agent(state.trip)           # pure call
+        dt = int((time.time() - t0) * 1000)
+
+        next_agent = ROUTING.get((current, output["decision"]))
+        log_event(trip_id, step, current, output, next_agent, dt)
+        record_visit(state, current, output["decision"])
+        bump_counters(state, current, output["decision"])
+
+        current = next_agent or "__END__"
+        step += 1
+
+    finalize_trip(trip_id, state)
+```
+
+- Orchestrator is the **only** writer to `run_state`.
+- Orchestrator is the **only** reader of `ROUTING`.
+- Agents never touch `trips.status` directly.
+
+---
+
+## 7. UI Spec
+
+### 7.1 Admin Console (Streamlit app #1)
+
+Purpose: seed mock data, create/edit/delete trips, inspect runs.
+
+**Pages (sidebar navigation):**
+
+| Page | Contents |
+|---|---|
+| **Dashboard** | Counts by status; recent runs table; "Run" button per row |
+| **Trips** | `st.data_editor` over `trips` (create / edit / delete); bulk CSV import |
+| **Trip Detail** | Form fields for one trip; button **Run orchestration**; live status |
+| **Reference Data** | Editors for `dest_costs`, `visa_rules`, `weather_profile`, `mock_flights`, `mock_hotels` |
+| **Run Inspector** | Pick a trip → table of `agent_events`; select row → JSON input/output viewer; **Decision graph** (rendered with `graphviz` or `streamlit-agraph`) |
+| **Danger Zone** | Reset DB, seed sample data |
+
+**Key behaviors**
+- Editing a trip that has `status='running'` is blocked.
+- "Run orchestration" calls `run_trip(trip_id)` in-process (v0.1) or via a queue (v0.2).
+- Run Inspector auto-refreshes every 2s while `status='running'`.
+
+### 7.2 Trip Planner (Streamlit app #2)
+
+Purpose: end-user submits a trip and watches the plan build.
+
+**Screens**
+
+1. **New Request form**
+   - Origin, destination, dates (`st.date_input`), budget (`st.number_input`), travelers, preferences (`st.text_area`).
+   - Submit → INSERT into `trips`, kick off run, then `st.rerun` into the "Tracking" screen.
+
+2. **Tracking screen**
+   - Polls `agent_events` + `run_state` every 1–2s.
+   - **Vertical decision timeline** — one row per hop:
+     ```
+     ✓ IntakeAgent       valid      0.95
+     ⚠ BudgetAgent       tight      0.72   "Est. $2,310 vs $2,000"
+     ↻ AlternativeAgent  retry            "Shift +3 days"
+     ✓ BudgetAgent       ok         0.88
+     ...
+     ```
+   - Progress bar: `hops_used / max_hops`.
+   - Cancel button → sets `status='failed'`, `terminated_reason='user_cancelled'`.
+
+3. **Result screen**
+   - **If completed**: itinerary card — flights, hotel, cost breakdown, notes.
+   - **If rejected**: reason card (which agent, which decision, why).
+   - **If error/loop_guard**: dev-friendly banner + link to Run Inspector (admin only).
+
+### 7.3 Shared conventions
+- Both apps read the same `DB_URL` from `.env`.
+- Use `st.session_state` to hold `trip_id` across reruns.
+- All long-running work runs in a background thread (v0.1: `threading.Thread`; v0.2: Celery/RQ).
+- Never block the Streamlit render loop on an agent call > 500ms.
+
+---
+
+## 8. Project Layout
+
+```
+travel_planner/
+├── app_admin.py                # Streamlit admin console
+├── app_planner.py              # Streamlit user app
+├── db/
+│   ├── schema.sql
+│   ├── seed.sql
+│   └── connection.py
+├── agents/
+│   ├── base.py                 # Agent protocol + output contract
+│   ├── intake.py
+│   ├── budget.py
+│   ├── visa.py
+│   ├── weather.py
+│   ├── alternative.py
+│   ├── flight.py
+│   ├── hotel.py
+│   ├── itinerary.py
+│   └── reject.py
+├── orchestrator/
+│   ├── routing.py              # ROUTING table
+│   ├── runner.py               # run_trip()
+│   └── guards.py               # loop / hop protection
+├── laya/
+│   └── registry.py             # Laya tool registration for agents
+├── ui/
+│   ├── components.py           # timeline, decision graph, JSON viewer
+│   └── styles.py
+├── tests/
+│   ├── test_routing.py
+│   ├── test_guards.py
+│   └── test_agents.py
+├── .env.example
+└── requirements.txt
+```
+
+---
+
+## 9. Acceptance Criteria (MVP)
+
+- [ ] Submitting a trip via **Trip Planner** creates a `trips` row and starts a run.
+- [ ] Every agent hop produces exactly one `agent_events` row.
+- [ ] Router returns the correct next agent for all 18 `(agent, decision)` pairs.
+- [ ] Happy path completes in ≤ 7 hops.
+- [ ] Recovery path (Budget `tight` → Alternative `retry`) completes in ≤ 10 hops.
+- [ ] A forced `Budget(impossible)` ends in `RejectAgent` with a reason string.
+- [ ] Loop guard triggers when the same `(agent, decision)` repeats.
+- [ ] Admin Run Inspector renders the decision graph for any finished run.
+- [ ] Both apps run against the same SQLite file without schema drift.
+
+---
+
+## 10. Milestones
+
+| M | Scope |
+|---|---|
+| **M1** | Schema + seed + `trips` CRUD in Admin Console |
+| **M2** | 3 agents (Intake, Budget, Reject) + hardcoded router + `run_trip()` |
+| **M3** | Full agent set + full routing table + guards |
+| **M4** | Trip Planner app with live timeline |
+| **M5** | Decision graph in Run Inspector + tests |
+| **M6 (v0.2)** | Swap rule router for LLM-as-router behind a feature flag |
+
+---
+
+## 11. Open Questions
+
+1. Mock data enough for v0.1, or integrate one real API (e.g., a flight search) early?
+2. Should `AlternativeAgent` be allowed to change **destination** or only **dates** in v0.1?
+3. Multi-currency support now or later?
+4. Do we need per-user accounts before public exposure, or is `user_id` as a free string fine?
+
+---
+

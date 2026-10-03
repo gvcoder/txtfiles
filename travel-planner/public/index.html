@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Travel Planner — Trip Requests Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app" v-cloak>
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="logo-badge">✈️</div>
+        <div>
+          <h1 class="brand-title">WanderWise Intake</h1>
+          <p class="brand-subtitle">WhatsApp Travel Request Extractor & Trip Management</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="btn btn-secondary" @click="fetchTrips" :disabled="loading">
+          <span :class="{ 'spin': loading }">🔄</span> Refresh
+        </button>
+        <button class="btn btn-primary" @click="openNewModal">
+          <span>➕</span> New Trip Request
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="main-content">
+      <!-- Quick Stats Banner -->
+      <section class="stats-row">
+        <div class="stat-card">
+          <div class="stat-label">Total Requests</div>
+          <div class="stat-value">{{ stats.total }}</div>
+          <div class="stat-trend">SQLite Store</div>
+        </div>
+        <div class="stat-card pending">
+          <div class="stat-label">Pending Review</div>
+          <div class="stat-value">{{ stats.pending }}</div>
+          <div class="stat-trend">Needs Pipeline</div>
+        </div>
+        <div class="stat-card running">
+          <div class="stat-label">Agent In-Progress</div>
+          <div class="stat-value">{{ stats.running }}</div>
+          <div class="stat-trend">Active Runs</div>
+        </div>
+        <div class="stat-card completed">
+          <div class="stat-label">Completed Plans</div>
+          <div class="stat-value">{{ stats.completed }}</div>
+          <div class="stat-trend">Ready Itinerary</div>
+        </div>
+      </section>
+
+      <!-- WhatsApp Live Extractor Box -->
+      <section class="extractor-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="pill-icon">💬</span>
+            <h3>WhatsApp Message Extractor</h3>
+          </div>
+          <span class="badge badge-accent">Auto Entity Parsing</span>
+        </div>
+        <p class="section-desc">
+          Paste unstructured customer WhatsApp travel inquiries below. The system automatically extracts origin, destination, dates, traveler count, companions, and trip category into the SQLite schema.
+        </p>
+
+        <!-- Sample presets -->
+        <div class="presets-row">
+          <span class="preset-label">Try sample WhatsApp messages:</span>
+          <button
+            type="button"
+            class="preset-chip"
+            v-for="(preset, idx) in sampleMessages"
+            :key="idx"
+            @click="useSample(preset)"
+          >
+            "{{ preset.slice(0, 48) }}..."
+          </button>
+        </div>
+
+        <div class="extractor-body">
+          <div class="input-col">
+            <textarea
+              v-model="rawInput"
+              placeholder="e.g. 'I want to travel from Chennai to some hill station on 24 Dec 2026 with my wife - can you suggest some ideas'"
+              rows="4"
+              class="message-textarea"
+            ></textarea>
+            <div class="input-actions">
+              <button class="btn btn-outline" @click="testExtract" :disabled="!rawInput.trim() || parsing">
+                <span>⚡</span> Preview Extraction
+              </button>
+              <button class="btn btn-accent" @click="saveExtracted" :disabled="!rawInput.trim() || parsing">
+                <span>💾</span> Extract & Save to Table
+              </button>
+            </div>
+          </div>
+
+          <!-- Live Extraction Preview Card -->
+          <div class="preview-col" v-if="preview">
+            <div class="preview-header">
+              <span>Parsed Entity Preview</span>
+              <span class="confidence-tag">Structured Output</span>
+            </div>
+            <div class="preview-grid">
+              <div class="preview-item">
+                <span class="p-label">Origin:</span>
+                <span class="p-val highlight">{{ preview.origin || 'Not detected' }}</span>
+              </div>
+              <div class="preview-item">
+                <span class="p-label">Destination:</span>
+                <span class="p-val highlight">{{ preview.destination || 'Not detected' }}</span>
+              </div>
+              <div class="preview-item">
+                <span class="p-label">Travel Dates:</span>
+                <span class="p-val">{{ preview.start_date }} → {{ preview.end_date || 'N/A' }}</span>
+              </div>
+              <div class="preview-item">
+                <span class="p-label">Travelers:</span>
+                <span class="p-val">{{ preview.travelers }} ({{ preview.companions || 'Standard' }})</span>
+              </div>
+              <div class="preview-item">
+                <span class="p-label">Trip Type:</span>
+                <span class="p-badge">{{ preview.trip_type }}</span>
+              </div>
+              <div class="preview-item">
+                <span class="p-label">Est. Budget:</span>
+                <span class="p-val">${{ preview.budget_usd }}</span>
+              </div>
+              <div class="preview-item full-width" v-if="preview.laya_meta">
+                <span class="p-label">Laya ML Signals:</span>
+                <div class="laya-tag-group">
+                  <span class="laya-pill" v-if="preview.laya_meta.category_confidence">
+                    🎯 Category Confidence: {{ (preview.laya_meta.category_confidence * 100).toFixed(0) }}%
+                  </span>
+                  <span class="laya-pill" v-if="preview.laya_meta.timeframe">
+                    ⏱️ {{ preview.laya_meta.timeframe }}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Table Section -->
+      <section class="table-section">
+        <div class="table-toolbar">
+          <div class="search-box">
+            <span>🔍</span>
+            <input
+              type="text"
+              v-model="searchTerm"
+              @input="filterDebounce"
+              placeholder="Search origin, destination, message or tags..."
+            />
+          </div>
+
+          <div class="filter-group">
+            <label>Status Filter:</label>
+            <select v-model="statusFilter" @change="fetchTrips" class="select-filter">
+              <option value="all">All Statuses</option>
+              <option value="pending">Pending</option>
+              <option value="running">Running</option>
+              <option value="completed">Completed</option>
+              <option value="needs_info">Needs Info</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Trips Table -->
+        <div class="table-card">
+          <table class="trips-table">
+            <thead>
+              <tr>
+                <th width="60">ID</th>
+                <th>Trip Route</th>
+                <th>Dates</th>
+                <th>Travelers & Type</th>
+                <th>Budget</th>
+                <th>Original WhatsApp Message</th>
+                <th>Status</th>
+                <th width="120" style="text-align: right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="loading && trips.length === 0">
+                <td colspan="8" class="text-center py-5">Loading travel records...</td>
+              </tr>
+              <tr v-else-if="trips.length === 0">
+                <td colspan="8" class="text-center py-5 empty-state">
+                  <div class="empty-icon">📂</div>
+                  <h4>No travel records found</h4>
+                  <p>Paste a WhatsApp message above or click 'New Trip Request'</p>
+                </td>
+              </tr>
+              <tr v-for="trip in trips" :key="trip.id" class="table-row">
+                <td class="id-cell">#{{ trip.id }}</td>
+                <td>
+                  <div class="route-display">
+                    <span class="route-from">{{ trip.origin }}</span>
+                    <span class="route-arrow">➔</span>
+                    <span class="route-to">{{ trip.destination }}</span>
+                  </div>
+                  <span class="category-chip">{{ trip.trip_type || 'Leisure' }}</span>
+                </td>
+                <td>
+                  <div class="date-cell">
+                    <strong>{{ formatDate(trip.start_date) }}</strong>
+                    <span v-if="trip.end_date" class="date-sub">to {{ formatDate(trip.end_date) }}</span>
+                  </div>
+                </td>
+                <td>
+                  <div class="traveler-info">
+                    <span class="traveler-count">👥 {{ trip.travelers }} pax</span>
+                    <span class="companion-tag" v-if="trip.companions">{{ trip.companions }}</span>
+                  </div>
+                </td>
+                <td>
+                  <span class="budget-tag">${{ trip.budget_usd || 0 }}</span>
+                </td>
+                <td class="raw-message-col" :title="trip.raw_message">
+                  <p class="truncate-text">{{ trip.raw_message || 'Manual entry' }}</p>
+                </td>
+                <td>
+                  <span :class="['status-badge', 'status-' + trip.status]">
+                    {{ trip.status }}
+                  </span>
+                </td>
+                <td class="actions-col">
+                  <button class="btn-icon play" @click="runPipeline(trip)" title="Run Multi-Agent Pipeline" :disabled="pipelineRunningId === trip.id">
+                    <span :class="{ 'spin': pipelineRunningId === trip.id }">{{ pipelineRunningId === trip.id ? '⚙️' : '▶️' }}</span>
+                  </button>
+                  <button class="btn-icon audit" @click="openTimelineModal(trip)" title="View Agent Audit Trail">
+                    📜
+                  </button>
+                  <button class="btn-icon chat" @click="openChatModal(trip)" title="Chat & Refine Trip Itinerary">
+                    💬
+                  </button>
+                  <button class="btn-icon edit" @click="openEditModal(trip)" title="Edit Record">
+                    ✏️
+                  </button>
+                  <button class="btn-icon delete" @click="deleteTrip(trip.id)" title="Delete Record">
+                    🗑️
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <!-- Multi-Agent Timeline & Audit Modal -->
+    <div class="modal-backdrop" v-if="showTimelineModal" @click.self="closeTimelineModal">
+      <div class="modal-card timeline-modal-card">
+        <div class="modal-header">
+          <div>
+            <h3>🤖 Multi-Agent Execution Audit: Trip #{{ activeTimelineTrip?.id }}</h3>
+            <span class="chat-trip-sub">
+              {{ activeTimelineTrip?.origin }} ➔ {{ activeTimelineTrip?.destination }} • Status: 
+              <strong :class="'text-' + activeTimelineTrip?.status">{{ activeTimelineTrip?.status?.toUpperCase() }}</strong>
+            </span>
+          </div>
+          <div class="modal-header-actions">
+            <button class="btn btn-sm btn-primary" @click="runPipeline(activeTimelineTrip)" :disabled="pipelineRunningId === activeTimelineTrip?.id">
+              <span>{{ pipelineRunningId === activeTimelineTrip?.id ? '⚙️ Running...' : '▶️ Re-Run Pipeline' }}</span>
+            </button>
+            <button class="close-btn" @click="closeTimelineModal">&times;</button>
+          </div>
+        </div>
+
+        <div class="timeline-body">
+          <!-- Summary Bar -->
+          <div class="run-state-bar" v-if="timelineRunState">
+            <div class="state-pill"><strong>Hops:</strong> {{ timelineRunState.hops_used }} / {{ timelineRunState.max_hops }}</div>
+            <div class="state-pill"><strong>Alternatives Tried:</strong> {{ timelineRunState.alternative_tries }} / {{ timelineRunState.max_alternatives }}</div>
+            <div class="state-pill"><strong>Termination:</strong> {{ timelineRunState.terminated_reason || 'In-progress' }}</div>
+          </div>
+
+          <!-- Empty Timeline -->
+          <div class="chat-empty" v-if="timelineEvents.length === 0">
+            <div class="empty-icon">⏳</div>
+            <h4>No agent runs recorded yet</h4>
+            <p>Click "Run Pipeline" to start deterministic multi-agent orchestration.</p>
+          </div>
+
+          <!-- Vertical Timeline Steps -->
+          <div class="timeline-stream" v-else>
+            <div
+              v-for="ev in timelineEvents"
+              :key="ev.id"
+              :class="['timeline-node', 'decision-' + ev.decision]"
+            >
+              <div class="node-marker">
+                <span class="node-step">#{{ ev.step_index + 1 }}</span>
+              </div>
+              <div class="node-content">
+                <div class="node-top">
+                  <span class="node-agent">{{ ev.agent_name }}</span>
+                  <span :class="['node-decision', 'badge-' + ev.decision]">
+                    {{ ev.decision }}
+                  </span>
+                  <span class="node-confidence" v-if="ev.confidence">
+                    {{ (ev.confidence * 100).toFixed(0) }}% conf
+                  </span>
+                  <span class="node-next" v-if="ev.next_agent">➔ {{ ev.next_agent }}</span>
+                  <span class="node-time">{{ ev.duration_ms }}ms</span>
+                </div>
+                <div class="node-reason">{{ ev.reasoning }}</div>
+                <details class="node-payload-toggle" v-if="ev.output_json && ev.output_json !== '{}'">
+                  <summary>View Output Payload</summary>
+                  <pre class="node-json">{{ formatJson(ev.output_json) }}</pre>
+                </details>
+              </div>
+            </div>
+          </div>
+
+          <!-- Final Itinerary Display if available -->
+          <div class="itinerary-result-card" v-if="activeTimelineTrip?.final_result">
+            <div class="itinerary-header">
+              <span>🌟 Final Structured Itinerary</span>
+            </div>
+            <div class="itinerary-content" style="white-space: pre-wrap;">
+              {{ getFinalItineraryText(activeTimelineTrip.final_result) }}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Interactive Chat Modal -->
+    <div class="modal-backdrop" v-if="showChatModal" @click.self="closeChatModal">
+      <div class="modal-card chat-modal-card">
+        <div class="modal-header">
+          <div>
+            <h3>💬 Travel Advisor Chat: {{ activeChatTrip?.origin }} ➔ {{ activeChatTrip?.destination }}</h3>
+            <span class="chat-trip-sub">
+              {{ activeChatTrip?.travelers }} pax ({{ activeChatTrip?.companions || 'Standard' }}) • {{ activeChatTrip?.trip_type }} • Budget: ${{ activeChatTrip?.budget_usd }}
+            </span>
+          </div>
+          <button class="close-btn" @click="closeChatModal">&times;</button>
+        </div>
+
+        <div class="chat-body" ref="chatBody">
+          <div class="chat-empty" v-if="chats.length === 0">
+            <div class="empty-icon">🗺️</div>
+            <h4>Start planning your journey!</h4>
+            <p>Ask WanderWise for day-by-day itineraries, resort options, scenic stops, or best local food.</p>
+          </div>
+
+          <div
+            v-for="c in chats"
+            :key="c.id"
+            :class="['chat-bubble', c.sender === 'user' ? 'bubble-user' : 'bubble-assistant']"
+          >
+            <div class="bubble-sender">{{ c.sender === 'user' ? 'You' : 'WanderWise AI' }}</div>
+            <div class="bubble-text" style="white-space: pre-wrap;">{{ c.message }}</div>
+          </div>
+
+          <div class="chat-bubble bubble-assistant" v-if="chatSending">
+            <div class="bubble-sender">WanderWise AI</div>
+            <div class="bubble-text"><span class="spin">⏳</span> Thinking & tailoring recommendations...</div>
+          </div>
+        </div>
+
+        <form @submit.prevent="sendChatMessage" class="chat-input-row">
+          <input
+            type="text"
+            v-model="chatInput"
+            placeholder="e.g. Can you suggest a 3-day itinerary and top 2 scenic viewpoints?"
+            :disabled="chatSending"
+          />
+          <button type="submit" class="btn btn-primary" :disabled="!chatInput.trim() || chatSending">
+            Send ➔
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Edit/Create Modal -->
+    <div class="modal-backdrop" v-if="showModal" @click.self="closeModal">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>{{ editingTrip ? 'Edit Trip Record #' + form.id : 'Create New Trip Request' }}</h3>
+          <button class="close-btn" @click="closeModal">&times;</button>
+        </div>
+
+        <form @submit.prevent="saveTripForm" class="modal-body">
+          <div class="form-group full-width" v-if="!editingTrip">
+            <label>Raw Customer Message / WhatsApp Inquiry</label>
+            <textarea
+              v-model="form.raw_message"
+              rows="2"
+              placeholder="Paste WhatsApp text to auto-fill details or enter manually below"
+              @blur="autoFillFromFormMessage"
+            ></textarea>
+            <small class="helper-text">Leaving this field will automatically extract values below if empty.</small>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Origin City *</label>
+              <input type="text" v-model="form.origin" required placeholder="e.g. Chennai" />
+            </div>
+            <div class="form-group">
+              <label>Destination / Area *</label>
+              <input type="text" v-model="form.destination" required placeholder="e.g. Munnar or Hill Station" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Start Date *</label>
+              <input type="date" v-model="form.start_date" required />
+            </div>
+            <div class="form-group">
+              <label>End Date</label>
+              <input type="date" v-model="form.end_date" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Number of Travelers</label>
+              <input type="number" min="1" v-model.number="form.travelers" />
+            </div>
+            <div class="form-group">
+              <label>Companions Info</label>
+              <input type="text" v-model="form.companions" placeholder="e.g. Wife, Family of 3, Friends" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Trip Type / Theme</label>
+              <select v-model="form.trip_type">
+                <option value="hill station">Hill Station</option>
+                <option value="resort stay">Resort Stay</option>
+                <option value="beach">Beach & Coastal</option>
+                <option value="leisure">General Leisure</option>
+                <option value="adventure">Adventure & Trek</option>
+                <option value="pilgrimage">Pilgrimage / Heritage</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Budget (USD)</label>
+              <input type="number" step="10" v-model.number="form.budget_usd" placeholder="e.g. 500" />
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Status</label>
+              <select v-model="form.status">
+                <option value="pending">Pending</option>
+                <option value="running">Running</option>
+                <option value="completed">Completed</option>
+                <option value="rejected">Rejected</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Preferences / Notes</label>
+              <input type="text" v-model="form.preferences" placeholder="e.g. vegetarian food, lake view" />
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" @click="closeModal">Cancel</button>
+            <button type="submit" class="btn btn-primary" :disabled="saving">
+              {{ saving ? 'Saving...' : (editingTrip ? 'Save Changes' : 'Create Record') }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
